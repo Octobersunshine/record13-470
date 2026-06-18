@@ -58,6 +58,95 @@ class PortForwarder extends EventEmitter {
     };
   }
 
+  _attachServerEvents(rule) {
+    const { localPort, targetHost, targetPort } = rule;
+    const server = net.createServer();
+    rule.server = server;
+
+    server.on('connection', (clientSocket) => {
+      if (rule.status !== 'running') {
+        clientSocket.destroy();
+        return;
+      }
+
+      if (rule.activeConnections >= this.maxConnectionsPerRule) {
+        this.emit('connectionRejected', {
+          localPort,
+          reason: 'perRuleLimit',
+          active: rule.activeConnections,
+          limit: this.maxConnectionsPerRule
+        });
+        clientSocket.destroy();
+        return;
+      }
+
+      if (this.totalActiveConnections >= this.maxTotalConnections) {
+        this.emit('connectionRejected', {
+          localPort,
+          reason: 'totalLimit',
+          active: this.totalActiveConnections,
+          limit: this.maxTotalConnections
+        });
+        clientSocket.destroy();
+        return;
+      }
+
+      rule.activeConnections++;
+      rule.totalConnections++;
+      this.totalActiveConnections++;
+
+      let clientBytes = 0;
+      let targetBytes = 0;
+
+      const targetSocket = net.connect({
+        host: targetHost,
+        port: targetPort
+      });
+
+      const cleanup = () => {
+        clientSocket.destroy();
+        targetSocket.destroy();
+      };
+
+      clientSocket.on('data', (chunk) => {
+        clientBytes += chunk.length;
+      });
+
+      targetSocket.on('data', (chunk) => {
+        targetBytes += chunk.length;
+      });
+
+      clientSocket.pipe(targetSocket);
+      targetSocket.pipe(clientSocket);
+
+      const handleClose = () => {
+        if (rule.activeConnections > 0) rule.activeConnections--;
+        if (this.totalActiveConnections > 0) this.totalActiveConnections--;
+        rule.totalBytesTransferred += clientBytes + targetBytes;
+        cleanup();
+      };
+
+      clientSocket.on('error', (err) => {
+        this.emit('error', { localPort, error: err, side: 'client' });
+        handleClose();
+      });
+
+      targetSocket.on('error', (err) => {
+        this.emit('error', { localPort, error: err, side: 'target' });
+        handleClose();
+      });
+
+      clientSocket.on('close', handleClose);
+      targetSocket.on('close', handleClose);
+    });
+
+    server.on('error', (err) => {
+      if (rule.status !== 'starting' && rule.status !== 'resuming') {
+        this.emit('error', { localPort, error: err, side: 'server' });
+      }
+    });
+  }
+
   createRule({ localPort, targetHost, targetPort, name }) {
     return new Promise((resolve, reject) => {
       if (this.rules.size >= this.maxRules) {
@@ -82,94 +171,78 @@ class PortForwarder extends EventEmitter {
         totalBytesTransferred: 0
       };
 
-      const server = net.createServer();
-      rule.server = server;
+      this.rules.set(localPort, rule);
+      this._attachServerEvents(rule);
 
-      server.on('connection', (clientSocket) => {
-        if (rule.activeConnections >= this.maxConnectionsPerRule) {
-          this.emit('connectionRejected', {
-            localPort,
-            reason: 'perRuleLimit',
-            active: rule.activeConnections,
-            limit: this.maxConnectionsPerRule
-          });
-          clientSocket.destroy();
-          return;
-        }
-
-        if (this.totalActiveConnections >= this.maxTotalConnections) {
-          this.emit('connectionRejected', {
-            localPort,
-            reason: 'totalLimit',
-            active: this.totalActiveConnections,
-            limit: this.maxTotalConnections
-          });
-          clientSocket.destroy();
-          return;
-        }
-
-        rule.activeConnections++;
-        rule.totalConnections++;
-        this.totalActiveConnections++;
-
-        let clientBytes = 0;
-        let targetBytes = 0;
-
-        const targetSocket = net.connect({
-          host: targetHost,
-          port: targetPort
-        });
-
-        const cleanup = () => {
-          clientSocket.destroy();
-          targetSocket.destroy();
-        };
-
-        clientSocket.on('data', (chunk) => {
-          clientBytes += chunk.length;
-        });
-
-        targetSocket.on('data', (chunk) => {
-          targetBytes += chunk.length;
-        });
-
-        clientSocket.pipe(targetSocket);
-        targetSocket.pipe(clientSocket);
-
-        const handleClose = () => {
-          rule.activeConnections--;
-          this.totalActiveConnections--;
-          rule.totalBytesTransferred += clientBytes + targetBytes;
-          cleanup();
-        };
-
-        clientSocket.on('error', (err) => {
-          this.emit('error', { localPort, error: err, side: 'client' });
-          handleClose();
-        });
-
-        targetSocket.on('error', (err) => {
-          this.emit('error', { localPort, error: err, side: 'target' });
-          handleClose();
-        });
-
-        clientSocket.on('close', handleClose);
-        targetSocket.on('close', handleClose);
-      });
-
-      server.on('error', (err) => {
-        if (rule.status === 'starting') {
-          reject(err);
-        } else {
-          this.emit('error', { localPort, error: err, side: 'server' });
-        }
-      });
-
-      server.listen(localPort, () => {
+      rule.server.listen(localPort, () => {
         rule.status = 'running';
-        this.rules.set(localPort, rule);
         this.emit('created', this._serializeRule(rule));
         resolve(this._serializeRule(rule));
+      });
+
+      rule.server.once('error', (err) => {
+        if (rule.status === 'starting') {
+          this.rules.delete(localPort);
+          reject(err);
+        }
+      });
+    });
+  }
+
+  pauseRule(localPort) {
+    return new Promise((resolve, reject) => {
+      const rule = this.rules.get(localPort);
+      if (!rule) {
+        return reject(new Error(`未找到端口 ${localPort} 的转发规则`));
+      }
+      if (rule.status === 'paused') {
+        return reject(new Error(`端口 ${localPort} 的转发规则已处于暂停状态`));
+      }
+      if (rule.status !== 'running') {
+        return reject(new Error(`端口 ${localPort} 的转发规则当前状态 (${rule.status})，无法暂停`));
+      }
+
+      rule.status = 'pausing';
+      rule.server.close(() => {
+        rule.server = null;
+        rule.status = 'paused';
+        this.emit('paused', { localPort });
+        resolve(this._serializeRule(rule));
+      });
+
+      rule.server.once('error', (err) => {
+        rule.status = 'running';
+        reject(err);
+      });
+    });
+  }
+
+  resumeRule(localPort) {
+    return new Promise((resolve, reject) => {
+      const rule = this.rules.get(localPort);
+      if (!rule) {
+        return reject(new Error(`未找到端口 ${localPort} 的转发规则`));
+      }
+      if (rule.status === 'running') {
+        return reject(new Error(`端口 ${localPort} 的转发规则已处于运行状态`));
+      }
+      if (rule.status !== 'paused') {
+        return reject(new Error(`端口 ${localPort} 的转发规则当前状态 (${rule.status})，无法启用`));
+      }
+
+      rule.status = 'resuming';
+      this._attachServerEvents(rule);
+
+      rule.server.listen(localPort, () => {
+        rule.status = 'running';
+        this.emit('resumed', this._serializeRule(rule));
+        resolve(this._serializeRule(rule));
+      });
+
+      rule.server.once('error', (err) => {
+        rule.status = 'paused';
+        rule.server = null;
+        reject(err);
       });
     });
   }
@@ -183,18 +256,23 @@ class PortForwarder extends EventEmitter {
 
       rule.status = 'stopping';
 
-      rule.server.close(() => {
+      const finishDelete = () => {
         this.rules.delete(localPort);
         this.emit('deleted', { localPort });
         resolve({ success: true, localPort });
-      });
+      };
 
-      rule.server.on('error', (err) => {
-        if (this.rules.has(localPort)) {
-          rule.status = 'running';
-        }
-        reject(err);
-      });
+      if (rule.server) {
+        rule.server.close(finishDelete);
+        rule.server.once('error', (err) => {
+          if (this.rules.has(localPort)) {
+            rule.status = rule.status === 'paused' ? 'paused' : 'running';
+          }
+          reject(err);
+        });
+      } else {
+        finishDelete();
+      }
     });
   }
 

@@ -33,6 +33,14 @@ portForwarder.on('deleted', ({ localPort }) => {
   console.info(`[转发规则] 已删除: 端口 ${localPort}`);
 });
 
+portForwarder.on('paused', ({ localPort }) => {
+  console.info(`[转发规则] 已暂停: 端口 ${localPort}`);
+});
+
+portForwarder.on('resumed', (rule) => {
+  console.info(`[转发规则] 已启用: ${rule.localPort} -> ${rule.targetHost}:${rule.targetPort}`);
+});
+
 app.post('/api/forward', async (req, res) => {
   try {
     const { localPort, targetHost, targetPort, name } = req.body;
@@ -124,6 +132,62 @@ app.delete('/api/forward', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({
+      success: false,
+      message: err.message
+    });
+  }
+});
+
+app.post('/api/forward/:localPort/pause', async (req, res) => {
+  try {
+    const localPort = parseInt(req.params.localPort, 10);
+
+    if (isNaN(localPort)) {
+      return res.status(400).json({
+        success: false,
+        message: 'localPort 参数无效'
+      });
+    }
+
+    const rule = await portForwarder.pauseRule(localPort);
+
+    res.json({
+      success: true,
+      data: rule,
+      message: `转发规则已暂停: 端口 ${localPort}`
+    });
+  } catch (err) {
+    const isConflict = err.message.includes('已处于') || err.message.includes('状态') || err.message.includes('无法');
+    const statusCode = err.message.includes('未找到') ? 404 : (isConflict ? 409 : 500);
+    res.status(statusCode).json({
+      success: false,
+      message: err.message
+    });
+  }
+});
+
+app.post('/api/forward/:localPort/resume', async (req, res) => {
+  try {
+    const localPort = parseInt(req.params.localPort, 10);
+
+    if (isNaN(localPort)) {
+      return res.status(400).json({
+        success: false,
+        message: 'localPort 参数无效'
+      });
+    }
+
+    const rule = await portForwarder.resumeRule(localPort);
+
+    res.json({
+      success: true,
+      data: rule,
+      message: `转发规则已启用: 端口 ${localPort}`
+    });
+  } catch (err) {
+    const isConflict = err.message.includes('已处于') || err.message.includes('状态') || err.message.includes('无法');
+    const statusCode = err.message.includes('未找到') ? 404 : (isConflict ? 409 : 500);
+    res.status(statusCode).json({
       success: false,
       message: err.message
     });
@@ -266,6 +330,8 @@ const server = app.listen(API_PORT, () => {
   console.log('  GET    /api/forward/:port        - 获取指定转发规则');
   console.log('  DELETE /api/forward/:port        - 删除转发规则');
   console.log('  DELETE /api/forward              - 删除所有转发规则');
+  console.log('  POST   /api/forward/:port/pause  - 暂停转发规则');
+  console.log('  POST   /api/forward/:port/resume - 启用转发规则');
   console.log('  GET    /api/stats                - 全局统计信息');
   console.log('  GET    /api/config/limits        - 获取当前资源限制');
   console.log('  PUT    /api/config/limits        - 修改资源限制');
