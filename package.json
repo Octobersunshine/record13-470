@@ -1,0 +1,16 @@
+{
+  "name": "port-forward-api",
+  "version": "1.0.0",
+  "description": "Node.js 端口转发 API - 创建本地端口至测试服务器端口转发规则",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js"
+  },
+  "keywords": ["port-forward", "proxy", "api"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
